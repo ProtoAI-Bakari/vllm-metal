@@ -1491,7 +1491,7 @@ class MetalModelRunner:
         return next_tokens
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self, scheduler_output: SchedulerOutput, grammar_output: Any = None
     ) -> ModelRunnerOutput | None:
         """Execute model inference with true batched decode.
 
