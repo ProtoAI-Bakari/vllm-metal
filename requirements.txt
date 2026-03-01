@@ -1,0 +1,22 @@
+# ==============================================================================
+# GOLDEN ARCHITECTURE LOCKFILE: vLLM MLX + Distributed Ray (Apple Silicon)
+# ==============================================================================
+# 1. Orchestration & Core Engine Constraints
+ray[default]==2.54.0
+transformers>=4.56.0,<5
+tokenizers==0.22.2
+
+# 2. PyTorch Backend (macOS ABI aligned)
+torch==2.10.0
+torchaudio==2.10.0
+torchvision==0.25.0
+
+# 3. Apple Silicon MLX Toolchain
+mlx==0.30.6
+mlx-metal==0.30.6
+mlx-lm==0.29.1
+mlx-vlm==0.3.0
+mlx-audio==0.2.10
+
+# 4. Objective-C Memory Collision Mitigation
+opencv-python-headless>=4.13.0
