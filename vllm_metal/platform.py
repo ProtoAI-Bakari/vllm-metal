@@ -3,6 +3,7 @@
 
 import logging
 import platform as py_platform
+from typing import Any
 from typing import TYPE_CHECKING
 
 import psutil
@@ -135,16 +136,13 @@ class MetalPlatform(Platform):
         """
         return 1
 
-    @classmethod
-    def set_device(cls, device_id: int) -> None:
-        """Set the current device.
+    @property
+    def ray_device_key(self) -> str:
+        return "GPU"
 
-        Args:
-            device_id: Device index (must be 0 for Metal)
-        """
-        if device_id != 0:
-            msg = f"Metal only supports device 0, got {device_id}"
-            raise ValueError(msg)
+    @classmethod
+    def set_device(cls, device_id: Any) -> None:
+        device_id = 0
 
         config = get_config()
         if config.use_mlx:

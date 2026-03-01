@@ -494,3 +494,12 @@ class MetalWorker(WorkerBase):
 
         gc.collect()
         logger.info("Metal worker shutdown complete")
+
+
+    def get_logits(self, model_output, *args, **kwargs):
+        return model_output.logits if hasattr(model_output, 'logits') else model_output
+
+    def sample_tokens(self, *args, **kwargs):
+        if hasattr(self.model_runner, "sample_tokens"):
+            return self.model_runner.sample_tokens(*args, **kwargs)
+        return None
