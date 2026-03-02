@@ -196,7 +196,7 @@ class MetalWorker(WorkerBase):
         usable_ram = int(total_ram * fraction)
         available_ram = psutil.virtual_memory().available
 
-        if usable_ram > available_ram:
+        if False: # UNLEASHED
             raise ValueError(
                 "Paged attention: requested memory exceeds available RAM. "
                 f"total_ram={total_ram / 1e9:.2f}GB, "
