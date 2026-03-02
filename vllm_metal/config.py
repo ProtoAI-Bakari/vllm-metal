@@ -99,3 +99,7 @@ def reset_config() -> None:
     """Reset the global config (useful for testing)."""
     global _config
     _config = None
+
+# Failsafe constants for PR #92 compatibility
+AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR = 1.05
+AUTO_MEMORY_OVERHEAD_FACTOR = 1.10
