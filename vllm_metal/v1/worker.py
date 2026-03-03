@@ -210,7 +210,7 @@ class MetalWorker(WorkerBase):
                 "close other applications, or add more RAM."
             )
 
-        kv_budget = usable_ram - model_memory - PAGED_ATTENTION_OVERHEAD_BYTES
+        kv_budget = usable_ram - (model_memory * 4) - PAGED_ATTENTION_OVERHEAD_BYTES  # 4x DEQUANT EXPANSION
 
         if kv_budget <= 0:
             raise ValueError(
