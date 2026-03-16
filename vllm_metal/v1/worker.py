@@ -213,7 +213,8 @@ class MetalWorker(WorkerBase):
         # Account for TP Sharding and 4x Dequantization Expansion
         tp_size = getattr(self.parallel_config, "tensor_parallel_size", 1)
         sharded_model_memory = model_memory / tp_size
-        kv_budget = usable_ram - (sharded_model_memory * 4) - PAGED_ATTENTION_OVERHEAD_BYTES
+        # Architect Fix: Removed 4x expansion multiplier to prevent negative budget
+        kv_budget = usable_ram - sharded_model_memory - PAGED_ATTENTION_OVERHEAD_BYTES
 
         if kv_budget <= 0:
             raise ValueError(
