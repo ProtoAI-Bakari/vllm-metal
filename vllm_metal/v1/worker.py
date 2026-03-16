@@ -601,3 +601,6 @@ class MetalWorker(WorkerBase):
         if hasattr(self.model_runner, "sample_tokens"):
             return self.model_runner.sample_tokens(*args, **kwargs)
         return None
+
+    def get_kv_connector_handshake_metadata(self) -> dict:
+        return {}
