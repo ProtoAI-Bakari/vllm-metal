@@ -287,9 +287,9 @@ class MetalKernelPagedAttentionWrapper(nn.Module):
         keys = inner.k_proj(x)
         values = inner.v_proj(x)
 
-        queries = queries.reshape(B, L, inner.n_heads, -1)
-        keys = keys.reshape(B, L, inner.n_kv_heads, -1)
-        values = values.reshape(B, L, inner.n_kv_heads, -1)
+        queries = queries.reshape(B, L, getattr(inner, 'num_attention_heads', getattr(inner, 'n_heads', 8)), -1)
+        keys = keys.reshape(B, L, getattr(inner, 'num_key_value_heads', getattr(inner, 'n_kv_heads', 8)), -1)
+        values = values.reshape(B, L, getattr(inner, 'num_key_value_heads', getattr(inner, 'n_kv_heads', 8)), -1)
 
         # Qwen3 per-head RMSNorm before RoPE
         if hasattr(inner, "q_norm"):
