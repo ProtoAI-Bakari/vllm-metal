@@ -229,7 +229,7 @@ class MetalWorker(WorkerBase):
                 "use a smaller model, or add more RAM."
             )
 
-        num_blocks = kv_budget // per_block_bytes
+        num_blocks = int(kv_budget // per_block_bytes)
 
         if num_blocks < PAGED_ATTENTION_MIN_BLOCKS:
             raise ValueError(
