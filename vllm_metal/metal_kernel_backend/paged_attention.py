@@ -112,7 +112,7 @@ def _metal_kernel_prefill_attention(
     # Causal SDPA (inline — K/V already in hand)
     attn_mask = "causal" if L > 1 else None
     output = mx.fast.scaled_dot_product_attention(
-        queries, keys, values, scale=attn_module.scale, mask=attn_mask
+        queries, keys, values, scale=getattr(attn_module, 'sm_scale', getattr(attn_module, 'scale', 1.0)), mask=attn_mask
     )
 
     # Write K/V into paged MPS cache via reshape_and_cache
@@ -213,7 +213,7 @@ def _metal_kernel_decode_attention(
     out = torch.zeros(B, n_heads, head_dim, dtype=cache.dtype, device="mps")
 
     max_seq_len = max(ctx.context_lens)
-    scale = attn_module.scale
+    scale = getattr(attn_module, 'sm_scale', getattr(attn_module, 'scale', 1.0))
 
     # Zero-copy paged attention
     ops.paged_attention_v1(
