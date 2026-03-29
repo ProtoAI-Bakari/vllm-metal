@@ -1579,19 +1579,32 @@ class MetalModelRunner:
                         break
                 break
 
-        # Verify we hooked something -- for Llama 8B with 32 layers,
-        # expect 64 hooks (32 o_proj + 32 down_proj)
-        expected = len(layers) * 2
-        if n_hooked != expected:
-            logger.warning(
-                "All-reduce hooks: installed %d, expected %d (some layers may have "
-                "non-standard naming)", n_hooked, expected,
-            )
-        else:
+        # For dense models (Llama), expect 2 hooks/layer (o_proj + down_proj = 64 for 32 layers).
+        # For MoE models (gpt-oss), MLP uses SwitchGLU with no down_proj — only o_proj hooked
+        # (1 hook/layer = 36 for 36 layers). Both patterns are correct.
+        n_layers = len(layers)
+        if n_hooked == n_layers * 2:
             logger.info(
                 "All-reduce hooks installed: %d hooks across %d layers "
                 "(o_proj + down_proj per layer), rank=%d/%d",
-                n_hooked, len(layers), self.tp_rank, self.tp_size,
+                n_hooked, n_layers, self.tp_rank, self.tp_size,
+            )
+        elif n_hooked == n_layers:
+            logger.info(
+                "All-reduce hooks installed: %d hooks across %d layers "
+                "(o_proj only — MoE MLP has no row-parallel down_proj), rank=%d/%d",
+                n_hooked, n_layers, self.tp_rank, self.tp_size,
+            )
+        elif n_hooked > 0:
+            logger.warning(
+                "All-reduce hooks: installed %d across %d layers "
+                "(expected %d or %d — check layer naming)",
+                n_hooked, n_layers, n_layers, n_layers * 2,
+            )
+        else:
+            logger.error(
+                "All-reduce hooks: 0 installed across %d layers — "
+                "no row-parallel projections found", n_layers,
             )
 
     def _extract_logits(self, model_output: Any) -> mx.array:
