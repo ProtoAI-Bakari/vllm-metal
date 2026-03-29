@@ -90,7 +90,30 @@ def init_worker_distributed_environment(
             import tempfile
             import torch.distributed as tdist
             if tdist.is_initialized():
-                my_ip = os.environ.get("VLLM_HOST_IP", "127.0.0.1")
+                # Detect this node's IP: VLLM_HOST_IP > GLOO interface > UDP connect trick
+                my_ip = os.environ.get("VLLM_HOST_IP", "")
+                if not my_ip or my_ip == "127.0.0.1":
+                    # Try GLOO_SOCKET_IFNAME (macOS: ipconfig getifaddr en0)
+                    import subprocess, sys as _sys
+                    ifname = os.environ.get("GLOO_SOCKET_IFNAME", "en0")
+                    if _sys.platform == "darwin":
+                        try:
+                            my_ip = subprocess.check_output(
+                                ["ipconfig", "getifaddr", ifname],
+                                text=True, timeout=2
+                            ).strip()
+                        except Exception:
+                            pass
+                    if not my_ip or my_ip == "127.0.0.1":
+                        # UDP connect trick — works cross-platform
+                        import socket as _sock
+                        try:
+                            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                            s.connect(("8.8.8.8", 80))
+                            my_ip = s.getsockname()[0]
+                            s.close()
+                        except Exception:
+                            my_ip = "127.0.0.1"
                 # Gather all worker IPs in rank order via GLOO
                 ip_list = [None] * tdist.get_world_size()
                 tdist.all_gather_object(ip_list, my_ip)
