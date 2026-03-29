@@ -790,6 +790,16 @@ class MetalModelRunner:
             )
             return
 
+        # GLOO barrier ensures all ranks call dist.init() simultaneously.
+        # Without this, ranks that finish model weight loading faster will
+        # call dist.init() before slower ranks are ready, causing ring
+        # backend TCP timeout (error 60).
+        import torch.distributed as _tdist
+        if _tdist.is_initialized():
+            logger.info("GLOO barrier before _shard_model_tp dist.init()...")
+            _tdist.barrier()
+            logger.info("GLOO barrier passed")
+
         group = dist.init()
         tp_size = group.size()
         rank = group.rank()
