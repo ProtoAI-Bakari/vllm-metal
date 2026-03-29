@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, TypeAlias
 
+import numpy as np
 import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
@@ -60,6 +61,18 @@ logger = init_logger(__name__)
 # Global model cache for fast repeated loads
 _model_cache: dict[str, tuple[Any, Any]] = {}  # model_name -> (model, tokenizer)
 _model_cache_lock = Lock()
+
+# Try to import MLX distributed for tensor-parallel sharding
+# Note: mlx.distributed does not exist as a standalone module in mlx 0.30+;
+# the distributed API lives at mlx.core.distributed (accessed as mx.distributed).
+try:
+    import mlx.core as _mlx_core
+    dist = _mlx_core.distributed
+    from mlx.nn.layers.distributed import shard_inplace, shard_linear
+
+    HAS_MLX_DISTRIBUTED = True
+except (ImportError, AttributeError):
+    HAS_MLX_DISTRIBUTED = False
 
 # Try to import Rust extension for high-performance token state management
 try:
@@ -352,9 +365,10 @@ def _merge_rotating_kv_caches(
     mlx-lm <= 0.29.1 uses ``c.offset`` which can exceed the underlying array size
     after the cache has rotated, causing a broadcast shape error.
 
-    This workaround can be removed once vllm-metal can depend on an mlx-lm version
-    that includes the upstream fix (ml-explore/mlx-lm#738) and has been verified
-    to work with gpt-oss models end-to-end.
+    ProtoAI-Bakari--rotating_kv_cache_offset_fix: upstream compatibility shim
+    for mlx-lm <= 0.29.1 offset overflow (ml-explore/mlx-lm#738).
+    Remove once vllm-metal can depend on a corrected mlx-lm release that has
+    been verified end-to-end with gpt-oss models.
     """
     if not caches:
         raise ValueError("caches must be non-empty")
@@ -604,6 +618,11 @@ class MetalModelRunner:
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
 
+        # Tensor parallel rank/size for weight sharding
+        self.tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        self.tp_rank = 0  # Updated in load_model after distributed init
+        logger.info("ProtoAI-Bakari--init: tp_size=%d from parallel_config", self.tp_size)
+
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
 
@@ -659,6 +678,29 @@ class MetalModelRunner:
 
         self._extract_model_args()
         self._resolve_model_dims()
+
+        # Apply tensor-parallel sharding if multi-device.
+        # _shard_model_tp() uses MLX distributed (replaces layers with sharded
+        # variants).  _shard_weights_tp() manually slices weight tensors for
+        # Ray/torch.distributed TP.  Only ONE path should run — if MLX
+        # distributed sharding succeeds, manual weight slicing would double-
+        # shard (size/tp/tp = garbage).
+        #
+        # BUG FIX (claude-vlm 2026-03-28): When MLX distributed is importable
+        # but the ring backend isn't initialized for multi-node, dist.init()
+        # returns size=1 and _shard_model_tp() skips sharding. Must fall back
+        # to manual _shard_weights_tp() in this case.
+        # Always use manual weight sharding — it's proven correct with UDP
+        # allreduce. MLX shard_linear bundles sharding+allreduce and needs
+        # perfect ring init synchronization between workers, which is fragile
+        # with Ray's async worker startup. Manual sharding + hooks is reliable.
+        self._shard_weights_tp()
+
+        # Install all-reduce hooks for row-parallel partial sums.
+        # The hooks will try native mx.distributed.all_sum() first (if the
+        # ring backend initialized), falling back to UDP.
+        self._install_tp_allreduce_hooks()
+
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
 
@@ -742,6 +784,815 @@ class MetalModelRunner:
         self.num_kv_heads: int = int(num_kv_heads)
         self.hidden_size = hidden_size
         self.head_dim: int = int(head_dim)
+
+    def _shard_model_tp(self) -> None:
+        """Apply tensor-parallel sharding to model weights using MLX distributed.
+
+        Converts linear layers to distributed variants:
+        - Column-parallel (all-to-sharded): QKV projections, gate/up MLP
+        - Row-parallel (sharded-to-all): output projection, down MLP
+        """
+        if not HAS_MLX_DISTRIBUTED:
+            logger.warning(
+                "mlx.distributed not available, skipping TP sharding"
+            )
+            return
+
+        group = dist.init()
+        tp_size = group.size()
+        rank = group.rank()
+
+        if tp_size <= 1:
+            logger.info("TP size is 1, skipping sharding")
+            return
+
+        logger.info(
+            "Applying MLX tensor-parallel sharding: tp_size=%d, rank=%d",
+            tp_size,
+            rank,
+        )
+
+        model = self.model
+        n_sharded = 0
+
+        # Find the transformer layers - try common attribute paths
+        layers = None
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = model.model.layers
+        elif hasattr(model, "layers"):
+            layers = model.layers
+        elif hasattr(model, "transformer") and hasattr(
+            model.transformer, "layers"
+        ):
+            layers = model.transformer.layers
+
+        if layers is None:
+            logger.error("Cannot find transformer layers for TP sharding")
+            return
+
+        for i, layer in enumerate(layers):
+            attn = None
+            mlp = None
+
+            # Find attention module
+            for attn_name in ("self_attn", "attention", "attn"):
+                if hasattr(layer, attn_name):
+                    attn = getattr(layer, attn_name)
+                    break
+
+            # Find MLP module
+            for mlp_name in ("mlp", "feed_forward", "ffn"):
+                if hasattr(layer, mlp_name):
+                    mlp = getattr(layer, mlp_name)
+                    break
+
+            if attn is not None:
+                # Column-parallel: Q, K, V projections
+                for proj_name in ("q_proj", "k_proj", "v_proj"):
+                    if hasattr(attn, proj_name):
+                        setattr(
+                            attn,
+                            proj_name,
+                            shard_linear(
+                                getattr(attn, proj_name),
+                                "all-to-sharded",
+                                group=group,
+                            ),
+                        )
+                        n_sharded += 1
+                # Fused QKV
+                if hasattr(attn, "qkv_proj"):
+                    attn.qkv_proj = shard_linear(
+                        attn.qkv_proj,
+                        "all-to-sharded",
+                        segments=3,
+                        group=group,
+                    )
+                    n_sharded += 1
+                # Row-parallel: output projection
+                for proj_name in ("o_proj", "out_proj", "dense"):
+                    if hasattr(attn, proj_name):
+                        shard_inplace(
+                            getattr(attn, proj_name),
+                            "sharded-to-all",
+                            group=group,
+                        )
+                        n_sharded += 1
+                        break
+
+            if mlp is not None:
+                # Column-parallel: gate and up projections
+                for proj_name in ("gate_proj", "w1", "gate"):
+                    if hasattr(mlp, proj_name):
+                        setattr(
+                            mlp,
+                            proj_name,
+                            shard_linear(
+                                getattr(mlp, proj_name),
+                                "all-to-sharded",
+                                group=group,
+                            ),
+                        )
+                        n_sharded += 1
+                        break
+                for proj_name in ("up_proj", "w3", "up"):
+                    if hasattr(mlp, proj_name):
+                        setattr(
+                            mlp,
+                            proj_name,
+                            shard_linear(
+                                getattr(mlp, proj_name),
+                                "all-to-sharded",
+                                group=group,
+                            ),
+                        )
+                        n_sharded += 1
+                        break
+                # Fused gate_up
+                if hasattr(mlp, "gate_up_proj"):
+                    mlp.gate_up_proj = shard_linear(
+                        mlp.gate_up_proj,
+                        "all-to-sharded",
+                        group=group,
+                    )
+                    n_sharded += 1
+                # Row-parallel: down projection
+                for proj_name in ("down_proj", "w2", "down"):
+                    if hasattr(mlp, proj_name):
+                        shard_inplace(
+                            getattr(mlp, proj_name),
+                            "sharded-to-all",
+                            group=group,
+                        )
+                        n_sharded += 1
+                        break
+
+        # Adjust head counts for tensor parallelism
+        if hasattr(self, "num_attention_heads") and self.num_attention_heads:
+            self.num_attention_heads = self.num_attention_heads // tp_size
+        if hasattr(self, "num_kv_heads"):
+            self.num_kv_heads = self.num_kv_heads // tp_size
+
+        logger.info(
+            "TP sharding complete: %d layers sharded across %d devices",
+            n_sharded,
+            tp_size,
+        )
+
+    def _shard_weights_tp(self) -> None:
+        """Post-load weight sharding for tensor parallelism.
+
+        After mlx_lm loads the full model, slice each linear layer's weights
+        to keep only this rank's portion. This reduces memory by 1/tp_size.
+        """
+        logger.info("ProtoAI-Bakari--_shard_weights_tp: ENTERED, tp_size=%d", self.tp_size)
+        if self.tp_size <= 1:
+            logger.info("ProtoAI-Bakari--_shard_weights_tp: SKIPPED (tp_size=%d <= 1)", self.tp_size)
+            return
+
+        # Get rank from torch.distributed (initialized by Ray/GLOO)
+        try:
+            import torch.distributed as tdist
+            if tdist.is_initialized():
+                self.tp_rank = tdist.get_rank()
+            else:
+                logger.warning("torch.distributed not initialized, cannot shard weights")
+                return
+        except Exception as e:
+            logger.warning("Cannot get TP rank: %s", e)
+            return
+
+        logger.info("Sharding weights: tp_rank=%d, tp_size=%d", self.tp_rank, self.tp_size)
+
+        # Find transformer layers
+        layers = None
+        model = self.model
+        for attr_path in ['model.layers', 'layers', 'transformer.layers']:
+            obj = model
+            try:
+                for part in attr_path.split('.'):
+                    obj = getattr(obj, part)
+                layers = obj
+                break
+            except AttributeError:
+                continue
+
+        if layers is None:
+            logger.error("Cannot find transformer layers for TP sharding")
+            return
+
+        n_sharded = 0
+        tp = self.tp_size
+        rank = self.tp_rank
+
+        def _shard_col(proj, tp, rank):
+            """Column-parallel: slice dim=0 (output features). Handles quantized scales/biases."""
+            w = proj.weight
+            chunk = w.shape[0] // tp
+            proj.weight = mx.array(w[rank * chunk:(rank + 1) * chunk])
+            if hasattr(proj, 'bias') and proj.bias is not None:
+                proj.bias = mx.array(proj.bias[rank * chunk:(rank + 1) * chunk])
+            if hasattr(proj, 'scales') and proj.scales is not None:
+                s = proj.scales
+                s_chunk = s.shape[0] // tp
+                proj.scales = mx.array(s[rank * s_chunk:(rank + 1) * s_chunk])
+            if hasattr(proj, 'biases') and proj.biases is not None:
+                b = proj.biases
+                b_chunk = b.shape[0] // tp
+                proj.biases = mx.array(b[rank * b_chunk:(rank + 1) * b_chunk])
+
+        def _shard_row(proj, tp, rank):
+            """Row-parallel: slice dim=1 (input features). Handles quantized scales/biases."""
+            w = proj.weight
+            chunk = w.shape[1] // tp
+            proj.weight = mx.array(w[:, rank * chunk:(rank + 1) * chunk])
+            # Row-parallel: scales/biases slice on dim=1 too
+            if hasattr(proj, 'scales') and proj.scales is not None:
+                s = proj.scales
+                s_chunk = s.shape[1] // tp
+                proj.scales = mx.array(s[:, rank * s_chunk:(rank + 1) * s_chunk])
+            if hasattr(proj, 'biases') and proj.biases is not None:
+                b = proj.biases
+                b_chunk = b.shape[1] // tp
+                proj.biases = mx.array(b[:, rank * b_chunk:(rank + 1) * b_chunk])
+            # Row-parallel bias fix: each rank computes partial = x_shard @ W.T + bias.
+            # After allreduce sum, bias gets multiplied by tp_size.
+            # Fix: only rank 0 keeps the bias; others zero it out.
+            if rank > 0 and hasattr(proj, 'bias') and proj.bias is not None:
+                proj.bias = mx.zeros_like(proj.bias)
+
+        for layer in layers:
+            # Column-parallel: slice output dim (dim=0 of weight)
+            for module_name in ['self_attn', 'attention', 'attn']:
+                attn = getattr(layer, module_name, None)
+                if attn is None:
+                    continue
+                for proj_name in ['q_proj', 'k_proj', 'v_proj']:
+                    proj = getattr(attn, proj_name, None)
+                    if proj is not None and hasattr(proj, 'weight'):
+                        _shard_col(proj, tp, rank)
+                        n_sharded += 1
+                # Fused QKV
+                qkv = getattr(attn, 'qkv_proj', None)
+                if qkv is not None and hasattr(qkv, 'weight'):
+                    w = qkv.weight
+                    # Fused QKV: split into 3 segments, shard each, recombine
+                    seg_size = w.shape[0] // 3
+                    chunk = seg_size // tp
+                    segments = []
+                    for s in range(3):
+                        seg = w[s * seg_size:(s + 1) * seg_size]
+                        segments.append(seg[rank * chunk:(rank + 1) * chunk])
+                    qkv.weight = mx.concatenate(segments, axis=0)
+                    n_sharded += 1
+                break
+
+            # Row-parallel: slice input dim (dim=1 of weight) for output proj
+            for module_name in ['self_attn', 'attention', 'attn']:
+                attn = getattr(layer, module_name, None)
+                if attn is None:
+                    continue
+                for proj_name in ['o_proj', 'out_proj']:
+                    proj = getattr(attn, proj_name, None)
+                    if proj is not None and hasattr(proj, 'weight'):
+                        _shard_row(proj, tp, rank)
+                        n_sharded += 1
+                        break
+                break
+
+            # MLP column-parallel: gate and up
+            for mlp_name in ['mlp', 'feed_forward', 'ffn']:
+                mlp = getattr(layer, mlp_name, None)
+                if mlp is None:
+                    continue
+                for proj_name in ['gate_proj', 'w1', 'gate']:
+                    proj = getattr(mlp, proj_name, None)
+                    if proj is not None and hasattr(proj, 'weight'):
+                        _shard_col(proj, tp, rank)
+                        n_sharded += 1
+                        break
+                for proj_name in ['up_proj', 'w3', 'up']:
+                    proj = getattr(mlp, proj_name, None)
+                    if proj is not None and hasattr(proj, 'weight'):
+                        _shard_col(proj, tp, rank)
+                        n_sharded += 1
+                        break
+                # Fused gate_up
+                fused = getattr(mlp, 'gate_up_proj', None)
+                if fused is not None and hasattr(fused, 'weight'):
+                    w = fused.weight
+                    seg_size = w.shape[0] // 2
+                    chunk = seg_size // tp
+                    gate_shard = w[:seg_size][rank * chunk:(rank + 1) * chunk]
+                    up_shard = w[seg_size:][rank * chunk:(rank + 1) * chunk]
+                    fused.weight = mx.concatenate([gate_shard, up_shard], axis=0)
+                    n_sharded += 1
+                # Row-parallel: down proj
+                for proj_name in ['down_proj', 'w2', 'down']:
+                    proj = getattr(mlp, proj_name, None)
+                    if proj is not None and hasattr(proj, 'weight'):
+                        _shard_row(proj, tp, rank)
+                        n_sharded += 1
+                        break
+                break
+
+        # Adjust head counts on the runner
+        if hasattr(self, 'num_kv_heads') and self.num_kv_heads is not None:
+            self.num_kv_heads = self.num_kv_heads // tp
+        if hasattr(self, 'num_heads') and self.num_heads is not None:
+            self.num_heads = self.num_heads // tp
+
+        # Patch the model's internal config so attention reshape uses sharded head counts
+        # MLX Llama stores args on model.args and n_heads/n_kv_heads on each attention module
+        model_args = getattr(model, 'args', None)
+        if model_args is not None:
+            if hasattr(model_args, 'num_attention_heads'):
+                model_args.num_attention_heads = model_args.num_attention_heads // tp
+            if hasattr(model_args, 'num_key_value_heads'):
+                model_args.num_key_value_heads = model_args.num_key_value_heads // tp
+            logger.info("Patched model.args: num_attention_heads=%s, num_key_value_heads=%s",
+                        getattr(model_args, 'num_attention_heads', '?'),
+                        getattr(model_args, 'num_key_value_heads', '?'))
+
+        # Patch each attention module's n_heads/n_kv_heads so Q/K/V reshape correctly
+        for layer in layers:
+            for module_name in ['self_attn', 'attention', 'attn']:
+                attn = getattr(layer, module_name, None)
+                if attn is None:
+                    continue
+                if hasattr(attn, 'n_heads'):
+                    attn.n_heads = attn.n_heads // tp
+                if hasattr(attn, 'n_kv_heads'):
+                    attn.n_kv_heads = attn.n_kv_heads // tp
+                if hasattr(attn, 'num_heads'):
+                    attn.num_heads = attn.num_heads // tp
+                if hasattr(attn, 'num_kv_heads'):
+                    attn.num_kv_heads = attn.num_kv_heads // tp
+                # gpt-oss uses num_attention_heads / num_key_value_heads
+                if hasattr(attn, 'num_attention_heads'):
+                    attn.num_attention_heads = attn.num_attention_heads // tp
+                if hasattr(attn, 'num_key_value_heads'):
+                    attn.num_key_value_heads = attn.num_key_value_heads // tp
+                # Recalculate num_key_value_groups after head count changes
+                if (hasattr(attn, 'num_key_value_groups') and
+                        hasattr(attn, 'num_attention_heads') and
+                        hasattr(attn, 'num_key_value_heads')):
+                    attn.num_key_value_groups = attn.num_attention_heads // attn.num_key_value_heads
+                # Resize model-specific tensors that depend on head count (e.g. gpt-oss sinks)
+                if hasattr(attn, 'sinks') and attn.sinks is not None:
+                    new_heads = getattr(attn, 'n_heads', getattr(attn, 'num_heads', getattr(attn, 'num_attention_heads', None)))
+                    if new_heads is not None and attn.sinks.shape[0] != new_heads:
+                        attn.sinks = mx.zeros((new_heads,), dtype=attn.sinks.dtype)
+                break
+
+        # Force MLX to free the sliced-away memory
+        mx.eval(mx.array([0]))
+
+        logger.info("Weight sharding complete: %d projections sharded, tp_rank=%d/%d", n_sharded, rank, tp)
+
+    def _install_tp_allreduce_hooks(self) -> None:
+        """Install forward hooks on row-parallel layers to all-reduce partial sums.
+
+        In tensor parallelism, column-parallel layers (q/k/v_proj, gate/up_proj)
+        shard the output dimension -- each rank computes a slice independently.
+        Row-parallel layers (o_proj, down_proj) shard the input dimension and
+        produce PARTIAL sums that must be all-reduced across ranks before the
+        residual connection adds them back to the hidden state.
+
+        Without this all-reduce, each rank sees only its own partial sum,
+        leading to garbage output.
+
+        ProtoAI-Bakari--tp_allreduce_inject: wrap __call__ on each o_proj and
+        down_proj Linear to append UDP all-reduce after matmul. MLX has no
+        forward-hook API like PyTorch, so we wrap __call__ directly.
+        """
+        logger.info("ProtoAI-Bakari--_install_tp_allreduce_hooks: ENTERED, tp_size=%d", self.tp_size)
+        if self.tp_size <= 1:
+            logger.info("ProtoAI-Bakari--_install_tp_allreduce_hooks: SKIPPED (tp_size=%d <= 1)", self.tp_size)
+            return
+
+        import sys
+        # ProtoAI-Bakari--udp_allreduce_path: add udp_allreduce to path on remote nodes
+        for udp_path in ["/Users/z", "/Users/z/udp_allreduce/..", "/home/z/AGENT"]:
+            if udp_path not in sys.path:
+                sys.path.insert(0, udp_path)
+        try:
+            from udp_allreduce import AllReduceGroup
+            from udp_allreduce.config import DEFAULT_PEERS
+        except Exception as e:
+            logger.error("Failed to import udp_allreduce: %s", e)
+            return
+        # Initialize the UDP all-reduce group for this rank.
+        # ProtoAI-Bakari--ray_peer_autodetect: Ray workers only propagate env
+        # vars listed in vllm/ray/ray_env.py (envs.environment_variables).
+        # VLLM_UDP_AR_PEERS is not in that list, so workers fall back to
+        # DEFAULT_PEERS (sys4-7 hardcoded) even when the driver sets the var.
+        # Fix: auto-detect live peers from Ray cluster topology so no env var
+        # propagation is needed at all.  Env vars remain as a manual override.
+        peer_ips = None
+
+        # 1. Prefer explicit env-var override (set on driver AND worker).
+        env_peers = os.environ.get("VLLM_UDP_AR_PEERS") or os.environ.get("UDP_AR_PEERS")
+        if env_peers:
+            peer_ips = [p.strip() for p in env_peers.split(",") if p.strip()]
+            logger.info(
+                "UDP all-reduce peers from env var: %s", peer_ips
+            )
+
+        # 2. Auto-detect from GLOO distributed group — gives actual rank-to-IP
+        #    mapping. This is correct even when Ray assigns workers to
+        #    arbitrary nodes (sorted Ray IPs were wrong: rank 1 on sys7 but
+        #    peers[1] was sys5).
+        if not peer_ips:
+            try:
+                import torch.distributed as _tdist
+                if _tdist.is_initialized():
+                    # Gather each rank's VLLM_HOST_IP via GLOO all_gather
+                    my_ip = os.environ.get("VLLM_HOST_IP", "127.0.0.1")
+                    # Use all_gather_object for rank-ordered IP list
+                    ip_list = [None] * _tdist.get_world_size()
+                    _tdist.all_gather_object(ip_list, my_ip)
+                    peer_ips = ip_list[:self.tp_size]
+                    logger.info(
+                        "UDP all-reduce peers from GLOO rank-to-IP mapping: %s",
+                        peer_ips,
+                    )
+            except Exception as _e:
+                logger.warning("GLOO peer auto-detect failed: %s", _e)
+
+        # 2b. Fallback: Ray topology (may give wrong rank-to-IP mapping)
+        if not peer_ips:
+            try:
+                import ray as _ray
+                if _ray.is_initialized():
+                    nodes = _ray.nodes()
+                    peer_ips = sorted([
+                        n["NodeManagerAddress"]
+                        for n in nodes
+                        if n.get("Alive", False)
+                    ])
+                    logger.info(
+                        "UDP all-reduce peers from Ray topology (sorted, may be wrong): %s",
+                        peer_ips,
+                    )
+                else:
+                    logger.warning(
+                        "Ray not initialized; cannot auto-detect peers"
+                    )
+            except Exception as _e:
+                logger.warning("Ray peer auto-detect failed: %s", _e)
+
+        # 3. Last resort: compiled-in DEFAULT_PEERS constant.
+        if not peer_ips:
+            peer_ips = list(DEFAULT_PEERS)
+            logger.warning(
+                "UDP all-reduce peers falling back to DEFAULT_PEERS: %s — "
+                "set VLLM_UDP_AR_PEERS or ensure Ray is initialized to fix this",
+                peer_ips,
+            )
+
+        # Robust rank detection: self.tp_rank may still be 0 if
+        # _shard_weights_tp skipped (e.g. torch.distributed not init at that
+        # point). Re-check now — workers have had more time to init.
+        effective_rank = self.tp_rank
+        try:
+            import torch.distributed as tdist
+            if tdist.is_initialized():
+                effective_rank = tdist.get_rank()
+                if effective_rank != self.tp_rank:
+                    logger.warning(
+                        "tp_rank mismatch: self.tp_rank=%d, tdist.get_rank()=%d — using %d",
+                        self.tp_rank, effective_rank, effective_rank,
+                    )
+                    self.tp_rank = effective_rank
+        except Exception:
+            pass
+
+        ar_group = AllReduceGroup(
+            rank=effective_rank,
+            world_size=self.tp_size,
+            peers=peer_ips[:self.tp_size],
+        )
+        # Store on self so it persists and can be cleaned up
+        self._allreduce_group = ar_group
+
+        _ar_msg = (
+            f"[UDP-AR] all-reduce group initialized: rank={effective_rank}, "
+            f"world_size={self.tp_size}, peers={peer_ips[:self.tp_size]}"
+        )
+        print(_ar_msg, flush=True)
+        logger.info(_ar_msg)
+
+        # Find transformer layers
+        model = self.model
+        layers = None
+        for attr_path in ['model.layers', 'layers', 'transformer.layers']:
+            obj = model
+            try:
+                for part in attr_path.split('.'):
+                    obj = getattr(obj, part)
+                layers = obj
+                break
+            except AttributeError:
+                continue
+
+        if layers is None:
+            logger.error("Cannot find transformer layers for all-reduce hooks")
+            return
+
+        # ProtoAI-Bakari--allreduce_wrapper_class: Python's __call__ dunder is
+        # resolved on the TYPE not the instance. Setting proj.__call__ = wrapper
+        # does NOT intercept proj(x). We must replace the module attribute on the
+        # parent with a wrapper class whose TYPE defines __call__.
+        #
+        # ProtoAI-Bakari--profiler: set VLLM_PROFILE_AR=1 to enable per-phase
+        # timing.  The branch is resolved once at class-definition time so there
+        # is zero per-call overhead when profiling is off.
+        _profile_ar_enabled = os.environ.get("VLLM_PROFILE_AR", "0") == "1"
+
+        if _profile_ar_enabled:
+            # Use the canonical ARProfiler from allreduce_hooks when available;
+            # fall back to a self-contained inline version otherwise.
+            try:
+                from allreduce_hooks import ARProfiler as _ARProfilerCls
+            except ImportError:
+                import collections as _col
+                import math as _math2
+
+                class _ARProfilerCls:  # type: ignore[no-redef]
+                    """Inline fallback ARProfiler for model_runner standalone path."""
+                    _singleton = None
+                    PHASE_NAMES = ("A:mx_eval", "B:mx_to_np", "C:all_reduce", "D:np_to_mx")
+
+                    def __init__(self):
+                        self._total = [0.0, 0.0, 0.0, 0.0]
+                        self._count = 0
+                        self._ring = _col.deque(maxlen=200)
+
+                    @classmethod
+                    def instance(cls):
+                        if cls._singleton is None:
+                            cls._singleton = cls()
+                        return cls._singleton
+
+                    def record(self, phases):
+                        for i, v in enumerate(phases):
+                            self._total[i] += v
+                        self._count += 1
+                        self._ring.append(phases)
+
+                    @classmethod
+                    def dump_profile(cls):
+                        p = cls.instance()
+                        n = p._count
+                        if n == 0:
+                            print("[ARProfiler] No calls recorded.")
+                            return
+                        total_wall = sum(p._total)
+                        print(f"\n{'='*60}")
+                        print(f"[ARProfiler]  AllReduce phase breakdown  ({n} calls)")
+                        print(f"{'='*60}")
+                        for i, name in enumerate(cls.PHASE_NAMES):
+                            avg_ms = (p._total[i] / n) * 1000.0
+                            pct = (p._total[i] / total_wall * 100.0) if total_wall else 0.0
+                            print(f"  {name:<18}  avg={avg_ms:.4f} ms  {pct:.1f}%")
+                        avg_call_ms = total_wall / n * 1000.0
+                        print(f"  Total/call  : {avg_call_ms:.4f} ms")
+                        print(f"  Est/token(64): {avg_call_ms * 64:.2f} ms  "
+                              f"({1000.0 / (avg_call_ms * 64):.1f} TPS AR ceiling)")
+                        if p._ring:
+                            totals = [sum(r) * 1000.0 for r in p._ring]
+                            mean_v = sum(totals) / len(totals)
+                            sd = _math2.sqrt(
+                                sum((x - mean_v) ** 2 for x in totals) / len(totals)
+                            )
+                            print(f"  Ring({len(p._ring)}): "
+                                  f"min={min(totals):.3f}  mean={mean_v:.3f}  "
+                                  f"max={max(totals):.3f}  sd={sd:.3f} ms")
+                        print(f"{'='*60}\n")
+
+            _ar_profiler_instance = _ARProfilerCls.instance()
+        else:
+            _ARProfilerCls = None          # type: ignore[assignment]
+            _ar_profiler_instance = None
+
+        # ---- Check if MLX native distributed is available and properly
+        #      initialized for multi-node.  If so, use mx.distributed.all_sum()
+        #      instead of the UDP allreduce (zero numpy, zero GIL, zero copies).
+        _use_native_mlx_allreduce = False
+        _mlx_dist_group = None
+        if HAS_MLX_DISTRIBUTED:
+            try:
+                _mlx_dist_group = dist.init()
+                if _mlx_dist_group.size() >= self.tp_size:
+                    _use_native_mlx_allreduce = True
+                    logger.info(
+                        "Using MLX native distributed all_sum for allreduce "
+                        "(group size=%d, tp_size=%d)",
+                        _mlx_dist_group.size(), self.tp_size,
+                    )
+            except Exception:
+                pass
+        if not _use_native_mlx_allreduce:
+            logger.info("Using UDP allreduce (MLX distributed not available for multi-node)")
+
+        class AllReduceLinearWrapper:
+            """Wrapper that forwards to original Linear then all-reduces.
+
+            This replaces the projection module on the parent (e.g., attn.o_proj)
+            so that Python's type-based __call__ dispatch invokes our wrapper.
+
+            When MLX native distributed is available (ring backend over TCP/TB4),
+            uses mx.distributed.all_sum() — zero numpy conversion, zero GIL.
+            Falls back to UDP allreduce via numpy bridge otherwise.
+            """
+
+            # Shared profiler reference.  None when profiling is disabled.
+            _profiler = _ar_profiler_instance
+            # Whether to use native MLX allreduce (set once, used in __call__)
+            _native = _use_native_mlx_allreduce
+            _mlx_group = _mlx_dist_group
+
+            def __init__(self, original_proj, layer_idx, proj_name, group):
+                self._original = original_proj
+                self._layer_idx = layer_idx
+                self._proj_name = proj_name
+                self._group = group  # UDP group (fallback)
+                self._call_count = 0
+                if not AllReduceLinearWrapper._native:
+                    # Only import numpy bridge if using UDP path
+                    from udp_allreduce.mlx_bridge import mx_to_numpy, numpy_to_mx
+                    self._mx_to_numpy = mx_to_numpy
+                    self._numpy_to_mx = numpy_to_mx
+                # Forward attribute access to original (for weight, scales, etc.)
+                for attr in dir(original_proj):
+                    if not attr.startswith('_') and attr not in ('weight', 'scales', 'biases'):
+                        try:
+                            setattr(self, attr, getattr(original_proj, attr))
+                        except (AttributeError, TypeError):
+                            pass
+
+            if _profile_ar_enabled:
+                def __call__(self, *args, **kwargs):
+                    # Step 1: compute partial sum via original linear forward
+                    partial = self._original(*args, **kwargs)
+
+                    # Phase A: mx.async_eval dispatches Metal cmd buffer (non-blocking)
+                    # Actual sync happens in _mx_to_numpy when np.array() reads the buffer
+                    _t0 = time.perf_counter()
+                    mx.async_eval(partial)
+                    _t1 = time.perf_counter()
+
+                    original_shape = partial.shape
+                    original_dtype_str = str(partial.dtype)
+
+                    # Phase B: MLX -> numpy bridge
+                    np_partial = self._mx_to_numpy(partial)
+                    _t2 = time.perf_counter()
+
+                    # Phase C: all-reduce network call (bf16-safe)
+                    if np_partial.dtype == np.uint16:
+                        flat_u16 = np_partial.ravel()
+                        buf = np.frombuffer(
+                            (flat_u16.astype(np.uint32) << 16).tobytes(), dtype=np.float32
+                        ).copy().reshape(np_partial.shape)
+                        self._group.all_reduce_(buf, op="sum")
+                        u32_view = np.frombuffer(buf.ravel().tobytes(), dtype=np.uint32)
+                        np_partial = (u32_view >> 16).astype(np.uint16).reshape(np_partial.shape)
+                    else:
+                        self._group.all_reduce_(np_partial, op="sum")
+                    _t3 = time.perf_counter()
+
+                    # Phase D: numpy -> MLX bridge
+                    reduced = self._numpy_to_mx(
+                        np_partial, target_dtype_str=original_dtype_str, shape=original_shape
+                    )
+                    _t4 = time.perf_counter()
+
+                    phases = (_t1 - _t0, _t2 - _t1, _t3 - _t2, _t4 - _t3)
+                    AllReduceLinearWrapper._profiler.record(phases)
+
+                    self._call_count += 1
+                    if self._call_count <= 2:
+                        logger.debug(
+                            "allreduce[profiled]: layer=%d %s call=%d shape=%s "
+                            "phases_ms=(%.3f,%.3f,%.3f,%.3f)",
+                            self._layer_idx, self._proj_name,
+                            self._call_count, original_shape,
+                            phases[0]*1e3, phases[1]*1e3, phases[2]*1e3, phases[3]*1e3,
+                        )
+
+                    return reduced
+            else:
+                def __call__(self, *args, **kwargs):
+                    # Step 1: compute partial sum via original linear forward
+                    partial = self._original(*args, **kwargs)
+
+                    # === NATIVE MLX DISTRIBUTED PATH ===
+                    # Zero numpy, zero GIL, zero copies — direct Metal buffer allreduce
+                    if AllReduceLinearWrapper._native:
+                        reduced = mx.distributed.all_sum(
+                            partial, group=AllReduceLinearWrapper._mlx_group
+                        )
+                        self._call_count += 1
+                        return reduced
+
+                    # === UDP ALLREDUCE FALLBACK PATH ===
+                    # Step 2: dispatch Metal cmd buffer (non-blocking)
+                    mx.async_eval(partial)
+
+                    original_shape = partial.shape
+                    original_dtype_str = str(partial.dtype)
+
+                    # Step 3: MLX -> numpy (near-zero-copy on unified memory)
+                    np_partial = self._mx_to_numpy(partial)
+
+                    # Bug #1 fix: bf16 is viewed as uint16 in numpy -- summing
+                    # uint16 bit patterns produces garbage. Cast to float32 for
+                    # the actual arithmetic, then cast back after all-reduce.
+                    if np_partial.dtype == np.uint16:
+                        flat_u16 = np_partial.ravel()
+                        buf = np.frombuffer(
+                            (flat_u16.astype(np.uint32) << 16).tobytes(), dtype=np.float32
+                        ).copy().reshape(np_partial.shape)
+                        self._group.all_reduce_(buf, op="sum")
+                        u32_view = np.frombuffer(buf.ravel().tobytes(), dtype=np.uint32)
+                        np_partial = (u32_view >> 16).astype(np.uint16).reshape(np_partial.shape)
+                    else:
+                        self._group.all_reduce_(np_partial, op="sum")
+
+                    # Step 5: numpy -> MLX
+                    reduced = self._numpy_to_mx(np_partial, target_dtype_str=original_dtype_str,
+                                          shape=original_shape)
+
+                    self._call_count += 1
+                    if self._call_count <= 2:
+                        logger.debug(
+                            "allreduce: layer=%d %s call=%d shape=%s",
+                            self._layer_idx, self._proj_name,
+                            self._call_count, original_shape,
+                        )
+
+                    return reduced
+
+            @classmethod
+            def dump_profile(cls):
+                """Print per-phase profiling report.  No-op when VLLM_PROFILE_AR!=1."""
+                if cls._profiler is not None:
+                    cls._profiler.dump_profile()
+                else:
+                    print("[AllReduceLinearWrapper] Profiling disabled. "
+                          "Set VLLM_PROFILE_AR=1 to enable.")
+
+            def __getattr__(self, name):
+                # Delegate attribute access to the original module
+                return getattr(self._original, name)
+
+        n_hooked = 0
+
+        for layer_idx, layer in enumerate(layers):
+            # Hook attention output projection (o_proj / out_proj)
+            for module_name in ['self_attn', 'attention', 'attn']:
+                attn = getattr(layer, module_name, None)
+                if attn is None:
+                    continue
+                for proj_name in ['o_proj', 'out_proj']:
+                    proj = getattr(attn, proj_name, None)
+                    if proj is not None:
+                        wrapper = AllReduceLinearWrapper(proj, layer_idx, proj_name, ar_group)
+                        setattr(attn, proj_name, wrapper)
+                        n_hooked += 1
+                        break
+                break
+
+            # Hook MLP down projection (down_proj / w2 / down)
+            for mlp_name in ['mlp', 'feed_forward', 'ffn']:
+                mlp = getattr(layer, mlp_name, None)
+                if mlp is None:
+                    continue
+                for proj_name in ['down_proj', 'w2', 'down']:
+                    proj = getattr(mlp, proj_name, None)
+                    if proj is not None:
+                        wrapper = AllReduceLinearWrapper(proj, layer_idx, proj_name, ar_group)
+                        setattr(mlp, proj_name, wrapper)
+                        n_hooked += 1
+                        break
+                break
+
+        # Verify we hooked something -- for Llama 8B with 32 layers,
+        # expect 64 hooks (32 o_proj + 32 down_proj)
+        expected = len(layers) * 2
+        if n_hooked != expected:
+            logger.warning(
+                "All-reduce hooks: installed %d, expected %d (some layers may have "
+                "non-standard naming)", n_hooked, expected,
+            )
+        else:
+            logger.info(
+                "All-reduce hooks installed: %d hooks across %d layers "
+                "(o_proj + down_proj per layer), rank=%d/%d",
+                n_hooked, len(layers), self.tp_rank, self.tp_size,
+            )
 
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.

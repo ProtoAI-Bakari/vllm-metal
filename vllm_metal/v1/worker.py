@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal Worker for vLLM v1 engine."""
+"""Metal Worker for vLLM v1 engine.
+
+ProtoAI-Bakari: Apple Silicon Metal/MLX worker for vLLM inference.
+Targets M1/M2/M3 Ultra unified memory architecture with paged KV cache.
+"""
 
 from __future__ import annotations
 
 import gc
+import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +79,51 @@ def init_worker_distributed_environment(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
     )
+
+    # Set up MLX distributed ring backend env vars so mx.distributed.init()
+    # returns a properly sized group for multi-node allreduce.
+    # The ring backend needs MLX_RANK and MLX_HOSTFILE.
+    tp_size = parallel_config.tensor_parallel_size
+    if tp_size > 1:
+        try:
+            import json
+            import tempfile
+            import torch.distributed as tdist
+            if tdist.is_initialized():
+                my_ip = os.environ.get("VLLM_HOST_IP", "127.0.0.1")
+                # Gather all worker IPs in rank order via GLOO
+                ip_list = [None] * tdist.get_world_size()
+                tdist.all_gather_object(ip_list, my_ip)
+                # Build MLX hostfile: array of ["ip:port"] per rank
+                # Use ports starting at 32323, one per rank
+                base_port = 32323
+                hostfile = [
+                    [f"{ip}:{base_port + r}"]
+                    for r, ip in enumerate(ip_list[:tp_size])
+                ]
+                # Write hostfile to temp file
+                hostfile_path = os.path.join(
+                    tempfile.gettempdir(), f"mlx_hostfile_tp{tp_size}.json"
+                )
+                with open(hostfile_path, "w") as f:
+                    json.dump(hostfile, f)
+                # Set env vars for MLX distributed
+                os.environ["MLX_RANK"] = str(rank)
+                os.environ["MLX_HOSTFILE"] = hostfile_path
+                logger.info(
+                    "MLX distributed env set: MLX_RANK=%d, hostfile=%s, "
+                    "peers=%s",
+                    rank, hostfile_path, hostfile,
+                )
+                # CRITICAL: Barrier to ensure ALL workers have set their env
+                # vars before any worker calls mx.distributed.init(). The ring
+                # backend's TCP handshake requires both ranks to call init()
+                # within a ~5s window. Without this barrier, Ray's async worker
+                # startup means rank 0 might call init() 30s before rank 1.
+                tdist.barrier()
+                logger.info("GLOO barrier passed — all workers ready for MLX distributed init")
+        except Exception as e:
+            logger.warning("Failed to set MLX distributed env: %s", e)
 
 
 class MetalWorker(WorkerBase):
@@ -193,22 +244,13 @@ class MetalWorker(WorkerBase):
         per_block_bytes = self.get_cache_block_size_bytes()
 
         # --- Compute KV budget ---
+        # Bug #3 fix: use total RAM minus model + buffer, NOT instantaneous
+        # available RAM. During model loading, available is depressed (model
+        # pages are resident), leading to absurdly small KV cache (e.g. 2,240
+        # tokens on a 128GB machine). The model memory is already accounted
+        # for below in the kv_budget subtraction, so total is correct here.
+        BUFFER_BYTES = 4 * 1024 ** 3  # 4 GB headroom for OS + runtime
         usable_ram = int(total_ram * fraction)
-        available_ram = psutil.virtual_memory().available
-
-        if False: # UNLEASHED
-            raise ValueError(
-                "Paged attention: requested memory exceeds available RAM. "
-                f"total_ram={total_ram / 1e9:.2f}GB, "
-                f"fraction={fraction}, "
-                f"usable_ram={usable_ram / 1e9:.2f}GB, "
-                f"available_ram={available_ram / 1e9:.2f}GB. "
-                "The OS and other processes are using "
-                f"{(total_ram - available_ram) / 1e9:.2f}GB. "
-                "Mitigations: lower VLLM_METAL_MEMORY_FRACTION "
-                f"(try {available_ram / total_ram:.2f} or less), "
-                "close other applications, or add more RAM."
-            )
 
         # Account for TP Sharding and 4x Dequantization Expansion
         tp_size = getattr(self.parallel_config, "tensor_parallel_size", 1)
@@ -458,6 +500,10 @@ class MetalWorker(WorkerBase):
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """Initialize the KV cache.
 
+        .. deprecated::
+            Removed in vLLM 0.18.0 in favor of initialize_from_config().
+            Kept here for backward compatibility with current dev build.
+
         Args:
             num_gpu_blocks: Number of GPU cache blocks
             num_cpu_blocks: Number of CPU cache blocks (unused on Metal)
@@ -473,11 +519,19 @@ class MetalWorker(WorkerBase):
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def compile_or_warm_up_model(self) -> None:
-        """Warm up the model for inference."""
+    def compile_or_warm_up_model(self) -> float:
+        """Warm up the model for inference.
+
+        Returns:
+            Wall-clock seconds spent in warmup (vLLM 0.18.0 contract).
+        """
         # Reset seed for reproducibility
         set_random_seed(self.model_config.seed)
+        t0 = time.perf_counter()
         self.model_runner.warm_up()
+        elapsed = time.perf_counter() - t0
+        logger.info("Model warmup completed in %.2fs", elapsed)
+        return elapsed
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
@@ -597,11 +651,6 @@ class MetalWorker(WorkerBase):
 
     def get_logits(self, model_output, *args, **kwargs):
         return model_output.logits if hasattr(model_output, 'logits') else model_output
-
-    def sample_tokens(self, *args, **kwargs):
-        if hasattr(self.model_runner, "sample_tokens"):
-            return self.model_runner.sample_tokens(*args, **kwargs)
-        return None
 
     def get_kv_connector_handshake_metadata(self) -> dict:
         return {}

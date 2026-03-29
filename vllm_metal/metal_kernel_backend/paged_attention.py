@@ -215,6 +215,13 @@ def _metal_kernel_decode_attention(
     max_seq_len = max(ctx.context_lens)
     scale = getattr(attn_module, 'sm_scale', getattr(attn_module, 'scale', 1.0))
 
+    # Get actual TP rank for distributed attention
+    try:
+        import torch.distributed as _tdist
+        _tp_rank = _tdist.get_rank() if _tdist.is_initialized() else 0
+    except Exception:
+        _tp_rank = 0
+
     # Zero-copy paged attention
     ops.paged_attention_v1(
         out,
@@ -231,7 +238,7 @@ def _metal_kernel_decode_attention(
         "auto",  # kv_cache_dtype
         cache.k_scale_tensor,
         cache.v_scale_tensor,
-        0,  # tp_rank
+        _tp_rank,  # tp_rank — actual rank for distributed attention
         0,  # blocksparse_local_blocks
         0,  # blocksparse_vert_stride
         64,  # blocksparse_block_size

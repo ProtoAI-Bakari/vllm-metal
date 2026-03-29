@@ -130,10 +130,25 @@ class MetalPlatform(Platform):
         """Get number of available devices.
 
         Apple Silicon has unified memory, so we expose a single device.
+        When tensor parallelism is configured across multiple Metal nodes,
+        returns the TP size from VLLM_METAL_TP_SIZE or Ray cluster resources.
 
         Returns:
-            Always 1 for Metal
+            Device count (1 for single node, TP size for multi-node)
         """
+        import os
+        # Report device count matching tensor_parallel_size for multi-node Metal
+        tp = int(os.environ.get("VLLM_METAL_TP_SIZE", "1"))
+        if tp > 1:
+            return tp
+        # Check if Ray cluster has multiple Metal nodes
+        try:
+            import ray
+            if ray.is_initialized():
+                resources = ray.cluster_resources()
+                return max(1, int(resources.get("GPU", 1)))
+        except (ImportError, Exception):
+            pass
         return 1
 
     @property
@@ -214,9 +229,21 @@ class MetalPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
 
-        # Set executor backend (use uniproc for single device)
+        # Set executor backend (use uniproc for single device, Ray for TP > 1)
         if parallel_config.distributed_executor_backend in ("auto", None):
-            parallel_config.distributed_executor_backend = "uni"
+            if parallel_config.tensor_parallel_size > 1:
+                parallel_config.distributed_executor_backend = "ray"
+                logger.info("Metal TP=%d: using Ray distributed executor", parallel_config.tensor_parallel_size)
+            else:
+                parallel_config.distributed_executor_backend = "uni"
+
+        if parallel_config.tensor_parallel_size > 1:
+            logger.info(
+                "Metal TP mode: tp_size=%d, executor=%s, device_count=%d",
+                parallel_config.tensor_parallel_size,
+                parallel_config.distributed_executor_backend,
+                cls.get_device_count(),
+            )
 
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
