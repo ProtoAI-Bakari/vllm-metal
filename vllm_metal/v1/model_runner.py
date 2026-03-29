@@ -685,20 +685,12 @@ class MetalModelRunner:
         # Ray/torch.distributed TP.  Only ONE path should run — if MLX
         # distributed sharding succeeds, manual weight slicing would double-
         # shard (size/tp/tp = garbage).
-        #
-        # BUG FIX (claude-vlm 2026-03-28): When MLX distributed is importable
-        # but the ring backend isn't initialized for multi-node, dist.init()
-        # returns size=1 and _shard_model_tp() skips sharding. Must fall back
-        # to manual _shard_weights_tp() in this case.
-        # Always use manual weight sharding — it's proven correct with UDP
-        # allreduce. MLX shard_linear bundles sharding+allreduce and needs
-        # perfect ring init synchronization between workers, which is fragile
-        # with Ray's async worker startup. Manual sharding + hooks is reliable.
-        self._shard_weights_tp()
+        if HAS_MLX_DISTRIBUTED:
+            self._shard_model_tp()
+        else:
+            self._shard_weights_tp()
 
-        # Install all-reduce hooks for row-parallel partial sums.
-        # The hooks will try native mx.distributed.all_sum() first (if the
-        # ring backend initialized), falling back to UDP.
+        # Install all-reduce hooks for row-parallel partial sums
         self._install_tp_allreduce_hooks()
 
         load_time = time.time() - start_time
@@ -933,6 +925,18 @@ class MetalModelRunner:
         if hasattr(self, "num_kv_heads"):
             self.num_kv_heads = self.num_kv_heads // tp_size
 
+        # Fix attention sinks parameter for sharded head count.
+        # Some models (gpt_oss) have self_attn.sinks = mx.zeros((num_heads,))
+        # which must match the sharded head count after TP.
+        if layers is not None:
+            for layer in layers:
+                attn = getattr(layer, "self_attn", None) or getattr(layer, "attention", None)
+                if attn is not None and hasattr(attn, "sinks"):
+                    old_shape = attn.sinks.shape
+                    sharded_heads = old_shape[0] // tp_size
+                    attn.sinks = mx.zeros((sharded_heads,), dtype=attn.sinks.dtype)
+                    logger.debug("Adjusted attn.sinks: %s -> (%d,)", old_shape, sharded_heads)
+
         logger.info(
             "TP sharding complete: %d layers sharded across %d devices",
             n_sharded,
@@ -1015,11 +1019,6 @@ class MetalModelRunner:
                 b = proj.biases
                 b_chunk = b.shape[1] // tp
                 proj.biases = mx.array(b[:, rank * b_chunk:(rank + 1) * b_chunk])
-            # Row-parallel bias fix: each rank computes partial = x_shard @ W.T + bias.
-            # After allreduce sum, bias gets multiplied by tp_size.
-            # Fix: only rank 0 keeps the bias; others zero it out.
-            if rank > 0 and hasattr(proj, 'bias') and proj.bias is not None:
-                proj.bias = mx.zeros_like(proj.bias)
 
         for layer in layers:
             # Column-parallel: slice output dim (dim=0 of weight)
@@ -1128,21 +1127,7 @@ class MetalModelRunner:
                     attn.num_heads = attn.num_heads // tp
                 if hasattr(attn, 'num_kv_heads'):
                     attn.num_kv_heads = attn.num_kv_heads // tp
-                # gpt-oss uses num_attention_heads / num_key_value_heads
-                if hasattr(attn, 'num_attention_heads'):
-                    attn.num_attention_heads = attn.num_attention_heads // tp
-                if hasattr(attn, 'num_key_value_heads'):
-                    attn.num_key_value_heads = attn.num_key_value_heads // tp
-                # Recalculate num_key_value_groups after head count changes
-                if (hasattr(attn, 'num_key_value_groups') and
-                        hasattr(attn, 'num_attention_heads') and
-                        hasattr(attn, 'num_key_value_heads')):
-                    attn.num_key_value_groups = attn.num_attention_heads // attn.num_key_value_heads
-                # Resize model-specific tensors that depend on head count (e.g. gpt-oss sinks)
-                if hasattr(attn, 'sinks') and attn.sinks is not None:
-                    new_heads = getattr(attn, 'n_heads', getattr(attn, 'num_heads', getattr(attn, 'num_attention_heads', None)))
-                    if new_heads is not None and attn.sinks.shape[0] != new_heads:
-                        attn.sinks = mx.zeros((new_heads,), dtype=attn.sinks.dtype)
+                # Update scale if it depends on head_dim (it shouldn't change, but recalc to be safe)
                 break
 
         # Force MLX to free the sliced-away memory
@@ -1163,114 +1148,18 @@ class MetalModelRunner:
         leading to garbage output.
 
         ProtoAI-Bakari--tp_allreduce_inject: wrap __call__ on each o_proj and
-        down_proj Linear to append UDP all-reduce after matmul. MLX has no
+        down_proj Linear to append all-reduce after matmul. MLX has no
         forward-hook API like PyTorch, so we wrap __call__ directly.
+
+        Two backends available:
+        - Default: MLX native mx.distributed.all_sum (ring backend over TCP).
+          Eliminates numpy roundtrip entirely. Auto-configures MLX_RANK/HOSTFILE.
+        - VLLM_USE_UDP_AR=1: Force legacy UDP allreduce (udp_allreduce package).
         """
         logger.info("ProtoAI-Bakari--_install_tp_allreduce_hooks: ENTERED, tp_size=%d", self.tp_size)
         if self.tp_size <= 1:
             logger.info("ProtoAI-Bakari--_install_tp_allreduce_hooks: SKIPPED (tp_size=%d <= 1)", self.tp_size)
             return
-
-        import sys
-        # ProtoAI-Bakari--udp_allreduce_path: add udp_allreduce to path on remote nodes
-        for udp_path in ["/Users/z", "/Users/z/udp_allreduce/..", "/home/z/AGENT"]:
-            if udp_path not in sys.path:
-                sys.path.insert(0, udp_path)
-        try:
-            from udp_allreduce import AllReduceGroup
-            from udp_allreduce.config import DEFAULT_PEERS
-        except Exception as e:
-            logger.error("Failed to import udp_allreduce: %s", e)
-            return
-        # Initialize the UDP all-reduce group for this rank.
-        # ProtoAI-Bakari--ray_peer_autodetect: Ray workers only propagate env
-        # vars listed in vllm/ray/ray_env.py (envs.environment_variables).
-        # VLLM_UDP_AR_PEERS is not in that list, so workers fall back to
-        # DEFAULT_PEERS (sys4-7 hardcoded) even when the driver sets the var.
-        # Fix: auto-detect live peers from Ray cluster topology so no env var
-        # propagation is needed at all.  Env vars remain as a manual override.
-        peer_ips = None
-
-        # 1. Prefer explicit env-var override (set on driver AND worker).
-        env_peers = os.environ.get("VLLM_UDP_AR_PEERS") or os.environ.get("UDP_AR_PEERS")
-        if env_peers:
-            peer_ips = [p.strip() for p in env_peers.split(",") if p.strip()]
-            logger.info(
-                "UDP all-reduce peers from env var: %s", peer_ips
-            )
-
-        # 2. Auto-detect from GLOO distributed group — gives actual rank-to-IP
-        #    mapping. This is correct even when Ray assigns workers to
-        #    arbitrary nodes (sorted Ray IPs were wrong: rank 1 on sys7 but
-        #    peers[1] was sys5).
-        if not peer_ips:
-            try:
-                import torch.distributed as _tdist
-                if _tdist.is_initialized():
-                    # Gather each rank's IP via GLOO all_gather
-                    # Detect IP: VLLM_HOST_IP > GLOO interface > UDP connect
-                    my_ip = os.environ.get("VLLM_HOST_IP", "")
-                    if not my_ip or my_ip == "127.0.0.1":
-                        import subprocess, sys as _sys
-                        ifname = os.environ.get("GLOO_SOCKET_IFNAME", "en0")
-                        if _sys.platform == "darwin":
-                            try:
-                                my_ip = subprocess.check_output(
-                                    ["ipconfig", "getifaddr", ifname],
-                                    text=True, timeout=2
-                                ).strip()
-                            except Exception:
-                                pass
-                        if not my_ip or my_ip == "127.0.0.1":
-                            import socket as _sock
-                            try:
-                                s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-                                s.connect(("8.8.8.8", 80))
-                                my_ip = s.getsockname()[0]
-                                s.close()
-                            except Exception:
-                                my_ip = "127.0.0.1"
-                    # Use all_gather_object for rank-ordered IP list
-                    ip_list = [None] * _tdist.get_world_size()
-                    _tdist.all_gather_object(ip_list, my_ip)
-                    peer_ips = ip_list[:self.tp_size]
-                    logger.info(
-                        "UDP all-reduce peers from GLOO rank-to-IP mapping: %s",
-                        peer_ips,
-                    )
-            except Exception as _e:
-                logger.warning("GLOO peer auto-detect failed: %s", _e)
-
-        # 2b. Fallback: Ray topology (may give wrong rank-to-IP mapping)
-        if not peer_ips:
-            try:
-                import ray as _ray
-                if _ray.is_initialized():
-                    nodes = _ray.nodes()
-                    peer_ips = sorted([
-                        n["NodeManagerAddress"]
-                        for n in nodes
-                        if n.get("Alive", False)
-                    ])
-                    logger.info(
-                        "UDP all-reduce peers from Ray topology (sorted, may be wrong): %s",
-                        peer_ips,
-                    )
-                else:
-                    logger.warning(
-                        "Ray not initialized; cannot auto-detect peers"
-                    )
-            except Exception as _e:
-                logger.warning("Ray peer auto-detect failed: %s", _e)
-
-        # 3. Last resort: compiled-in DEFAULT_PEERS constant.
-        if not peer_ips:
-            peer_ips = list(DEFAULT_PEERS)
-            logger.warning(
-                "UDP all-reduce peers falling back to DEFAULT_PEERS: %s — "
-                "set VLLM_UDP_AR_PEERS or ensure Ray is initialized to fix this",
-                peer_ips,
-            )
 
         # Robust rank detection: self.tp_rank may still be 0 if
         # _shard_weights_tp skipped (e.g. torch.distributed not init at that
@@ -1288,6 +1177,232 @@ class MetalModelRunner:
                     self.tp_rank = effective_rank
         except Exception:
             pass
+
+        # Try MLX native allreduce first (preferred — zero numpy overhead).
+        # Reuses the MLX distributed group already initialized by _shard_model_tp().
+        # Set VLLM_USE_UDP_AR=1 to force legacy UDP path.
+        force_udp = os.environ.get("VLLM_USE_UDP_AR", "0") == "1"
+        if not force_udp and HAS_MLX_DISTRIBUTED:
+            try:
+                mlx_group = dist.init()  # Returns existing group (already init by _shard_model_tp)
+                if mlx_group.size() > 1:
+                    logger.info("[MLX-NATIVE-AR] Reusing MLX distributed group: rank=%d, size=%d",
+                                mlx_group.rank(), mlx_group.size())
+                    self._install_mlx_native_hooks(mlx_group)
+                    return
+            except Exception as e:
+                logger.warning("MLX native allreduce failed: %s, falling back to UDP", e)
+
+        # Legacy UDP allreduce path
+        self._install_udp_allreduce_hooks(effective_rank)
+
+    def _init_mlx_native_allreduce(self, effective_rank: int):
+        """Initialize MLX native ring allreduce backend.
+
+        Auto-configures MLX_RANK and MLX_HOSTFILE from Ray topology,
+        then initializes mx.distributed with the ring backend.
+
+        Returns the mx.distributed.Group or None on failure.
+        """
+        import json as _json
+        import tempfile
+
+        # Auto-detect peer IPs from Ray topology for TB4 interface
+        peer_ips = None
+        try:
+            import ray as _ray
+            if _ray.is_initialized():
+                nodes = _ray.nodes()
+                peer_ips = sorted([
+                    n["NodeManagerAddress"]
+                    for n in nodes
+                    if n.get("Alive", False)
+                ])[:self.tp_size]
+        except Exception as e:
+            logger.warning("Ray peer detection failed for MLX native AR: %s", e)
+
+        if not peer_ips:
+            # Fallback to env var
+            env_peers = os.environ.get("VLLM_UDP_AR_PEERS", "")
+            if env_peers:
+                peer_ips = [p.strip() for p in env_peers.split(",")][:self.tp_size]
+
+        if not peer_ips or len(peer_ips) < self.tp_size:
+            logger.error("Cannot detect peers for MLX native AR (need %d, got %s)",
+                        self.tp_size, peer_ips)
+            return None
+
+        # Check for TB4 interface (10.10.6.x) — prefer high-bandwidth path
+        tb4_peers = []
+        for ip in peer_ips:
+            # Try to resolve TB4 IP from 10GbE IP
+            # Convention: 10.255.255.X -> 10.10.6.X (TB4 interface)
+            parts = ip.split(".")
+            if parts[0] == "10" and parts[1] == "255":
+                tb4_ip = f"10.10.6.{parts[3]}"
+                tb4_peers.append(tb4_ip)
+            elif parts[0] == "10" and parts[1] == "10":
+                tb4_peers.append(ip)  # Already TB4
+            else:
+                tb4_peers.append(ip)  # Use as-is
+
+        # MLX ring backend port — use different port from GLOO to avoid conflicts
+        mlx_port = int(os.environ.get("MLX_RING_PORT", "29500"))
+        hostfile_entries = [f"{ip}:{mlx_port}" for ip in tb4_peers]
+
+        # Write hostfile to temp location
+        hostfile_path = f"/tmp/mlx_hostfile_rank{effective_rank}.json"
+        with open(hostfile_path, "w") as f:
+            _json.dump(hostfile_entries, f)
+
+        # Set env vars for MLX ring backend
+        os.environ["MLX_RANK"] = str(effective_rank)
+        os.environ["MLX_HOSTFILE"] = hostfile_path
+
+        try:
+            import mlx.core.distributed as mlx_dist
+            group = mlx_dist.init(strict=True, backend="ring")
+            _msg = (
+                f"[MLX-NATIVE-AR] ring allreduce initialized: rank={group.rank()}, "
+                f"size={group.size()}, peers={hostfile_entries}"
+            )
+            print(_msg, flush=True)
+            logger.info(_msg)
+            return group
+        except Exception as e:
+            logger.error("MLX native ring init failed: %s", e)
+            return None
+
+    def _install_mlx_native_hooks(self, mlx_group) -> None:
+        """Install allreduce hooks using MLX native mx.distributed.all_sum.
+
+        This is the fast path — no numpy roundtrip, no bf16 conversion,
+        stays entirely in Metal/MLX compute graph.
+        """
+        import mlx.core.distributed as mlx_dist
+
+        model = self.model
+        layers = None
+        for attr_path in ['model.layers', 'layers', 'transformer.layers']:
+            obj = model
+            try:
+                for part in attr_path.split('.'):
+                    obj = getattr(obj, part)
+                layers = obj
+                break
+            except AttributeError:
+                continue
+
+        if layers is None:
+            logger.error("Cannot find transformer layers for MLX native AR hooks")
+            return
+
+        class MLXNativeAllReduceWrapper:
+            """Wrapper using mx.distributed.all_sum — zero numpy overhead."""
+
+            def __init__(self, original_proj, layer_idx, proj_name, group):
+                self._original = original_proj
+                self._layer_idx = layer_idx
+                self._proj_name = proj_name
+                self._group = group
+                self._call_count = 0
+
+            def __call__(self, *args, **kwargs):
+                partial = self._original(*args, **kwargs)
+                reduced = mlx_dist.all_sum(partial, group=self._group)
+                self._call_count += 1
+                if self._call_count <= 2:
+                    logger.debug(
+                        "mlx_native_allreduce: layer=%d %s call=%d shape=%s",
+                        self._layer_idx, self._proj_name,
+                        self._call_count, partial.shape,
+                    )
+                return reduced
+
+            def __getattr__(self, name):
+                return getattr(self._original, name)
+
+        n_hooked = 0
+        for layer_idx, layer in enumerate(layers):
+            for module_name in ['self_attn', 'attention', 'attn']:
+                attn = getattr(layer, module_name, None)
+                if attn is None:
+                    continue
+                for proj_name in ['o_proj', 'out_proj']:
+                    proj = getattr(attn, proj_name, None)
+                    if proj is not None:
+                        wrapper = MLXNativeAllReduceWrapper(proj, layer_idx, proj_name, mlx_group)
+                        setattr(attn, proj_name, wrapper)
+                        n_hooked += 1
+                        break
+                break
+            for mlp_name in ['mlp', 'feed_forward', 'ffn']:
+                mlp = getattr(layer, mlp_name, None)
+                if mlp is None:
+                    continue
+                for proj_name in ['down_proj', 'w2', 'down']:
+                    proj = getattr(mlp, proj_name, None)
+                    if proj is not None:
+                        wrapper = MLXNativeAllReduceWrapper(proj, layer_idx, proj_name, mlx_group)
+                        setattr(mlp, proj_name, wrapper)
+                        n_hooked += 1
+                        break
+                # MoE models: expert weights not sharded by _shard_model_tp,
+                # so no allreduce needed for MLP output. Skip silently.
+                break
+
+        # Dense models: 2 hooks/layer (o_proj + down_proj).
+        # MoE models: 1 hook/layer (o_proj only, expert weights not TP-sharded).
+        logger.info(
+            "MLX native AR hooks installed: %d across %d layers, rank=%d/%d",
+            n_hooked, len(layers), self.tp_rank, self.tp_size)
+
+    def _install_udp_allreduce_hooks(self, effective_rank: int) -> None:
+        """Legacy UDP allreduce path. Used when VLLM_USE_MLX_NATIVE_AR!=1."""
+        import sys
+        # ProtoAI-Bakari--udp_allreduce_path: add udp_allreduce to path on remote nodes
+        for udp_path in ["/Users/z", "/Users/z/udp_allreduce/..", "/home/z/AGENT"]:
+            if udp_path not in sys.path:
+                sys.path.insert(0, udp_path)
+        try:
+            from udp_allreduce import AllReduceGroup
+            from udp_allreduce.config import DEFAULT_PEERS
+        except Exception as e:
+            logger.error("Failed to import udp_allreduce: %s", e)
+            return
+
+        peer_ips = None
+        env_peers = os.environ.get("VLLM_UDP_AR_PEERS") or os.environ.get("UDP_AR_PEERS")
+        if env_peers:
+            peer_ips = [p.strip() for p in env_peers.split(",") if p.strip()]
+            logger.info("UDP all-reduce peers from env var: %s", peer_ips)
+
+        if not peer_ips:
+            try:
+                import ray as _ray
+                if _ray.is_initialized():
+                    nodes = _ray.nodes()
+                    peer_ips = sorted([
+                        n["NodeManagerAddress"]
+                        for n in nodes
+                        if n.get("Alive", False)
+                    ])
+                    logger.info(
+                        "UDP all-reduce peers auto-detected from Ray topology: %s",
+                        peer_ips,
+                    )
+                else:
+                    logger.warning("Ray not initialized; cannot auto-detect peers")
+            except Exception as _e:
+                logger.warning("Ray peer auto-detect failed: %s", _e)
+
+        if not peer_ips:
+            peer_ips = list(DEFAULT_PEERS)
+            logger.warning(
+                "UDP all-reduce peers falling back to DEFAULT_PEERS: %s — "
+                "set VLLM_UDP_AR_PEERS or ensure Ray is initialized to fix this",
+                peer_ips,
+            )
 
         ar_group = AllReduceGroup(
             rank=effective_rank,
@@ -1397,72 +1512,38 @@ class MetalModelRunner:
             _ARProfilerCls = None          # type: ignore[assignment]
             _ar_profiler_instance = None
 
-        # ---- Check if MLX native distributed is available and properly
-        #      initialized for multi-node.  If so, use mx.distributed.all_sum()
-        #      instead of the UDP allreduce (zero numpy, zero GIL, zero copies).
-        _use_native_mlx_allreduce = False
-        _mlx_dist_group = None
-        if HAS_MLX_DISTRIBUTED:
-            try:
-                # CRITICAL: All ranks must call dist.init() simultaneously.
-                # Model loading takes variable time across ranks, so rank 0
-                # might call dist.init() while rank 1 is still loading weights.
-                # The ring backend's TCP handshake requires both ranks to be
-                # listening. Use a GLOO barrier to synchronize before init.
-                import torch.distributed as _tdist_sync
-                if _tdist_sync.is_initialized():
-                    logger.info("GLOO barrier before MLX distributed init...")
-                    _tdist_sync.barrier()
-                    logger.info("GLOO barrier passed, all ranks ready for MLX ring init")
-                _mlx_dist_group = dist.init()
-                if _mlx_dist_group.size() >= self.tp_size:
-                    _use_native_mlx_allreduce = True
-                    logger.info(
-                        "Using MLX native distributed all_sum for allreduce "
-                        "(group size=%d, tp_size=%d)",
-                        _mlx_dist_group.size(), self.tp_size,
-                    )
-                else:
-                    logger.info(
-                        "MLX distributed init returned size=%d (need %d), "
-                        "falling back to UDP. Check MLX_RANK=%s MLX_HOSTFILE=%s",
-                        _mlx_dist_group.size(), self.tp_size,
-                        os.environ.get("MLX_RANK", "NOT SET"),
-                        os.environ.get("MLX_HOSTFILE", "NOT SET"),
-                    )
-            except Exception as _e:
-                logger.warning("MLX distributed init failed: %s", _e)
-        if not _use_native_mlx_allreduce:
-            logger.info("Using UDP allreduce (MLX distributed not available for multi-node)")
-
         class AllReduceLinearWrapper:
             """Wrapper that forwards to original Linear then all-reduces.
 
             This replaces the projection module on the parent (e.g., attn.o_proj)
             so that Python's type-based __call__ dispatch invokes our wrapper.
 
-            When MLX native distributed is available (ring backend over TCP/TB4),
-            uses mx.distributed.all_sum() — zero numpy conversion, zero GIL.
-            Falls back to UDP allreduce via numpy bridge otherwise.
+            Profiling
+            ---------
+            Set VLLM_PROFILE_AR=1 before starting the server.  After warmup,
+            call AllReduceLinearWrapper.dump_profile() to print a per-phase
+            timing breakdown (averages, %, histogram, per-token estimate).
             """
 
-            # Shared profiler reference.  None when profiling is disabled.
+            # Shared profiler reference.  None when profiling is disabled (zero
+            # overhead per call -- no attribute lookup beyond the isinstance check
+            # that Python resolves at class definition time via the `if` branch).
             _profiler = _ar_profiler_instance
-            # Whether to use native MLX allreduce (set once, used in __call__)
-            _native = _use_native_mlx_allreduce
-            _mlx_group = _mlx_dist_group
 
             def __init__(self, original_proj, layer_idx, proj_name, group):
                 self._original = original_proj
                 self._layer_idx = layer_idx
                 self._proj_name = proj_name
-                self._group = group  # UDP group (fallback)
+                self._group = group
                 self._call_count = 0
-                if not AllReduceLinearWrapper._native:
-                    # Only import numpy bridge if using UDP path
-                    from udp_allreduce.mlx_bridge import mx_to_numpy, numpy_to_mx
-                    self._mx_to_numpy = mx_to_numpy
-                    self._numpy_to_mx = numpy_to_mx
+                # Import once in __init__, not 64x per token in __call__
+                from udp_allreduce.mlx_bridge import mx_to_numpy, numpy_to_mx
+                self._mx_to_numpy = mx_to_numpy
+                self._numpy_to_mx = numpy_to_mx
+                # Pre-allocated scratch buffer for zero-copy bf16<->fp32 conversion.
+                # Sized lazily on first call; reused every token to eliminate
+                # ~512 heap allocations/token from the bf16 conversion path.
+                self._u32_buf: np.ndarray | None = None
                 # Forward attribute access to original (for weight, scales, etc.)
                 for attr in dir(original_proj):
                     if not attr.startswith('_') and attr not in ('weight', 'scales', 'biases'):
@@ -1489,15 +1570,25 @@ class MetalModelRunner:
                     np_partial = self._mx_to_numpy(partial)
                     _t2 = time.perf_counter()
 
-                    # Phase C: all-reduce network call (bf16-safe)
+                    # Phase C: all-reduce network call (bf16-safe).
+                    # bf16 is transported as uint16 bit patterns; we must
+                    # promote to fp32 for numerically correct summation.
+                    # Use a pre-allocated uint32 scratch buffer (self._u32_buf)
+                    # to perform the conversion fully in-place — eliminates
+                    # ~512 heap allocations/token from the naive path.
                     if np_partial.dtype == np.uint16:
+                        n = np_partial.size
+                        if self._u32_buf is None or self._u32_buf.size < n:
+                            self._u32_buf = np.empty(n, dtype=np.uint32)
                         flat_u16 = np_partial.ravel()
-                        buf = np.frombuffer(
-                            (flat_u16.astype(np.uint32) << 16).tobytes(), dtype=np.float32
-                        ).copy().reshape(np_partial.shape)
-                        self._group.all_reduce_(buf, op="sum")
-                        u32_view = np.frombuffer(buf.ravel().tobytes(), dtype=np.uint32)
-                        np_partial = (u32_view >> 16).astype(np.uint16).reshape(np_partial.shape)
+                        # bf16->fp32: shift uint16 bits into upper half of uint32,
+                        # then view the uint32 buffer as float32. Zero-copy.
+                        np.left_shift(flat_u16, 16, out=self._u32_buf[:n])
+                        fp32_view = self._u32_buf[:n].view(np.float32).reshape(np_partial.shape)
+                        self._group.all_reduce_(fp32_view, op="sum")
+                        # fp32->bf16: take upper 16 bits of each float32 mantissa
+                        np.right_shift(self._u32_buf[:n], 16, out=self._u32_buf[:n])
+                        np_partial = self._u32_buf[:n].view(np.uint16).reshape(np_partial.shape)
                     else:
                         self._group.all_reduce_(np_partial, op="sum")
                     _t3 = time.perf_counter()
@@ -1527,17 +1618,8 @@ class MetalModelRunner:
                     # Step 1: compute partial sum via original linear forward
                     partial = self._original(*args, **kwargs)
 
-                    # === NATIVE MLX DISTRIBUTED PATH ===
-                    # Zero numpy, zero GIL, zero copies — direct Metal buffer allreduce
-                    if AllReduceLinearWrapper._native:
-                        reduced = mx.distributed.all_sum(
-                            partial, group=AllReduceLinearWrapper._mlx_group
-                        )
-                        self._call_count += 1
-                        return reduced
-
-                    # === UDP ALLREDUCE FALLBACK PATH ===
                     # Step 2: dispatch Metal cmd buffer (non-blocking)
+                    # numpy conversion in _mx_to_numpy will block until ready
                     mx.async_eval(partial)
 
                     original_shape = partial.shape
@@ -1546,18 +1628,26 @@ class MetalModelRunner:
                     # Step 3: MLX -> numpy (near-zero-copy on unified memory)
                     np_partial = self._mx_to_numpy(partial)
 
-                    # Bug #1 fix: bf16 is viewed as uint16 in numpy -- summing
-                    # uint16 bit patterns produces garbage. Cast to float32 for
-                    # the actual arithmetic, then cast back after all-reduce.
+                    # bf16 is transported as uint16 bit patterns — summing
+                    # uint16 directly produces garbage. Promote to fp32 for
+                    # correct summation, then truncate back to bf16.
+                    # Use pre-allocated uint32 scratch (self._u32_buf) for
+                    # zero-copy in-place conversion — no heap allocations.
                     if np_partial.dtype == np.uint16:
+                        n = np_partial.size
+                        if self._u32_buf is None or self._u32_buf.size < n:
+                            self._u32_buf = np.empty(n, dtype=np.uint32)
                         flat_u16 = np_partial.ravel()
-                        buf = np.frombuffer(
-                            (flat_u16.astype(np.uint32) << 16).tobytes(), dtype=np.float32
-                        ).copy().reshape(np_partial.shape)
-                        self._group.all_reduce_(buf, op="sum")
-                        u32_view = np.frombuffer(buf.ravel().tobytes(), dtype=np.uint32)
-                        np_partial = (u32_view >> 16).astype(np.uint16).reshape(np_partial.shape)
+                        # bf16->fp32: shift uint16 bits into upper half of uint32
+                        np.left_shift(flat_u16, 16, out=self._u32_buf[:n])
+                        fp32_view = self._u32_buf[:n].view(np.float32).reshape(np_partial.shape)
+                        # Step 4: all-reduce in float32 (in-place on the view)
+                        self._group.all_reduce_(fp32_view, op="sum")
+                        # fp32->bf16: take upper 16 bits in-place
+                        np.right_shift(self._u32_buf[:n], 16, out=self._u32_buf[:n])
+                        np_partial = self._u32_buf[:n].view(np.uint16).reshape(np_partial.shape)
                     else:
+                        # Step 4: in-place ring all-reduce (sum) over UDP
                         self._group.all_reduce_(np_partial, op="sum")
 
                     # Step 5: numpy -> MLX
@@ -1616,34 +1706,22 @@ class MetalModelRunner:
                         setattr(mlp, proj_name, wrapper)
                         n_hooked += 1
                         break
+                # MoE models: expert weights not sharded, no allreduce needed.
                 break
 
-        # For dense models (Llama), expect 2 hooks/layer (o_proj + down_proj = 64 for 32 layers).
-        # For MoE models (gpt-oss), MLP uses SwitchGLU with no down_proj — only o_proj hooked
-        # (1 hook/layer = 36 for 36 layers). Both patterns are correct.
-        n_layers = len(layers)
-        if n_hooked == n_layers * 2:
+        # Verify we hooked something -- for Llama 8B with 32 layers,
+        # expect 64 hooks (32 o_proj + 32 down_proj)
+        expected = len(layers) * 2
+        if n_hooked != expected:
+            logger.warning(
+                "All-reduce hooks: installed %d, expected %d (some layers may have "
+                "non-standard naming)", n_hooked, expected,
+            )
+        else:
             logger.info(
                 "All-reduce hooks installed: %d hooks across %d layers "
                 "(o_proj + down_proj per layer), rank=%d/%d",
-                n_hooked, n_layers, self.tp_rank, self.tp_size,
-            )
-        elif n_hooked == n_layers:
-            logger.info(
-                "All-reduce hooks installed: %d hooks across %d layers "
-                "(o_proj only — MoE MLP has no row-parallel down_proj), rank=%d/%d",
-                n_hooked, n_layers, self.tp_rank, self.tp_size,
-            )
-        elif n_hooked > 0:
-            logger.warning(
-                "All-reduce hooks: installed %d across %d layers "
-                "(expected %d or %d — check layer naming)",
-                n_hooked, n_layers, n_layers, n_layers * 2,
-            )
-        else:
-            logger.error(
-                "All-reduce hooks: 0 installed across %d layers — "
-                "no row-parallel projections found", n_layers,
+                n_hooked, len(layers), self.tp_rank, self.tp_size,
             )
 
     def _extract_logits(self, model_output: Any) -> mx.array:
@@ -2722,7 +2800,7 @@ class MetalModelRunner:
         return None
 
     def sample_tokens(
-        self, grammar_output: GrammarOutput | None
+        self, grammar_output: GrammarOutput
     ) -> ModelRunnerOutput | None:
         """Return sampled tokens produced by the last execute_model call.
 

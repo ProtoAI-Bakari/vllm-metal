@@ -82,19 +82,24 @@ def init_worker_distributed_environment(
 
     # Set up MLX distributed ring backend env vars so mx.distributed.init()
     # returns a properly sized group for multi-node allreduce.
-    # The ring backend needs MLX_RANK and MLX_HOSTFILE.
     tp_size = parallel_config.tensor_parallel_size
+    print(f"[VLM-DEBUG] tp_size={tp_size}", flush=True)
     if tp_size > 1:
         try:
             import json
+            import re
             import tempfile
             import torch.distributed as tdist
+            print(f"[VLM-DEBUG] tdist.is_initialized()={tdist.is_initialized()}, "
+                  f"rank={tdist.get_rank() if tdist.is_initialized() else -1}",
+                  flush=True)
             if tdist.is_initialized():
-                # Detect this node's IP: VLLM_HOST_IP > GLOO interface > UDP connect trick
+                import subprocess
+                import sys as _sys
+                rank = tdist.get_rank()
+                # Detect this node's IP
                 my_ip = os.environ.get("VLLM_HOST_IP", "")
                 if not my_ip or my_ip == "127.0.0.1":
-                    # Try GLOO_SOCKET_IFNAME (macOS: ipconfig getifaddr en0)
-                    import subprocess, sys as _sys
                     ifname = os.environ.get("GLOO_SOCKET_IFNAME", "en0")
                     if _sys.platform == "darwin":
                         try:
@@ -105,7 +110,6 @@ def init_worker_distributed_environment(
                         except Exception:
                             pass
                     if not my_ip or my_ip == "127.0.0.1":
-                        # UDP connect trick — works cross-platform
                         import socket as _sock
                         try:
                             s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
@@ -117,34 +121,42 @@ def init_worker_distributed_environment(
                 # Gather all worker IPs in rank order via GLOO
                 ip_list = [None] * tdist.get_world_size()
                 tdist.all_gather_object(ip_list, my_ip)
-                # Build MLX hostfile: array of ["ip:port"] per rank
-                # Use ports starting at 32323, one per rank
-                base_port = 32323
-                hostfile = [
-                    [f"{ip}:{base_port + r}"]
-                    for r, ip in enumerate(ip_list[:tp_size])
-                ]
+                mlx_ring_port = int(os.environ.get("MLX_RING_PORT", "29500"))
+                # Map to TB4 IPs if available (30+ Gbps vs 10 Gbps Ethernet)
+                _tb4_subnet = None
+                try:
+                    _ifout = subprocess.check_output(
+                        ["ifconfig"], text=True, timeout=5)
+                    for _m in re.finditer(r"inet (10\.10\.(\d+)\.\d+)", _ifout):
+                        _tb4_subnet = _m.group(2)
+                        break
+                except Exception:
+                    pass
+                def _to_tb4(ip):
+                    parts = ip.split(".")
+                    if _tb4_subnet and parts[0] == "10" and parts[1] == "255":
+                        return f"10.10.{_tb4_subnet}.{parts[3]}"
+                    return ip
+                tb4_ips = [_to_tb4(ip) for ip in ip_list[:tp_size]]
+                hostfile = [f"{ip}:{mlx_ring_port}" for ip in tb4_ips]
+                # Rank 0 broadcasts hostfile to ensure consistency
+                hostfile_shared = [None]
+                if rank == 0:
+                    hostfile_shared = [hostfile]
+                tdist.broadcast_object_list(hostfile_shared, src=0)
+                hostfile = hostfile_shared[0]
                 # Write hostfile to temp file
                 hostfile_path = os.path.join(
                     tempfile.gettempdir(), f"mlx_hostfile_tp{tp_size}.json"
                 )
                 with open(hostfile_path, "w") as f:
                     json.dump(hostfile, f)
-                # Set env vars for MLX distributed
                 os.environ["MLX_RANK"] = str(rank)
                 os.environ["MLX_HOSTFILE"] = hostfile_path
-                logger.info(
-                    "MLX distributed env set: MLX_RANK=%d, hostfile=%s, "
-                    "peers=%s",
-                    rank, hostfile_path, hostfile,
-                )
-                # CRITICAL: Barrier to ensure ALL workers have set their env
-                # vars before any worker calls mx.distributed.init(). The ring
-                # backend's TCP handshake requires both ranks to call init()
-                # within a ~5s window. Without this barrier, Ray's async worker
-                # startup means rank 0 might call init() 30s before rank 1.
+                print(f"[VLM-DEBUG] MLX env set: rank={rank}, "
+                      f"hostfile={hostfile}", flush=True)
+                # Barrier to ensure all workers ready before dist.init()
                 tdist.barrier()
-                logger.info("GLOO barrier passed — all workers ready for MLX distributed init")
         except Exception as e:
             logger.warning("Failed to set MLX distributed env: %s", e)
 
@@ -220,7 +232,7 @@ class MetalWorker(WorkerBase):
             device=self.device,
         )
 
-    def load_model(self) -> None:
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
@@ -558,7 +570,7 @@ class MetalWorker(WorkerBase):
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
-    ) -> ModelRunnerOutput | None:
+    ) -> "ModelRunnerOutput | AsyncModelRunnerOutput | None":
         """Execute model inference.
 
         Args:
@@ -569,7 +581,7 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.execute_model(scheduler_output)
 
-    def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
+    def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput:
         """Return sampled tokens for the previously executed batch."""
         return self.model_runner.sample_tokens(grammar_output)
 
