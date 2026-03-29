@@ -1383,6 +1383,16 @@ class MetalModelRunner:
         _mlx_dist_group = None
         if HAS_MLX_DISTRIBUTED:
             try:
+                # CRITICAL: All ranks must call dist.init() simultaneously.
+                # Model loading takes variable time across ranks, so rank 0
+                # might call dist.init() while rank 1 is still loading weights.
+                # The ring backend's TCP handshake requires both ranks to be
+                # listening. Use a GLOO barrier to synchronize before init.
+                import torch.distributed as _tdist_sync
+                if _tdist_sync.is_initialized():
+                    logger.info("GLOO barrier before MLX distributed init...")
+                    _tdist_sync.barrier()
+                    logger.info("GLOO barrier passed, all ranks ready for MLX ring init")
                 _mlx_dist_group = dist.init()
                 if _mlx_dist_group.size() >= self.tp_size:
                     _use_native_mlx_allreduce = True
@@ -1391,8 +1401,16 @@ class MetalModelRunner:
                         "(group size=%d, tp_size=%d)",
                         _mlx_dist_group.size(), self.tp_size,
                     )
-            except Exception:
-                pass
+                else:
+                    logger.info(
+                        "MLX distributed init returned size=%d (need %d), "
+                        "falling back to UDP. Check MLX_RANK=%s MLX_HOSTFILE=%s",
+                        _mlx_dist_group.size(), self.tp_size,
+                        os.environ.get("MLX_RANK", "NOT SET"),
+                        os.environ.get("MLX_HOSTFILE", "NOT SET"),
+                    )
+            except Exception as _e:
+                logger.warning("MLX distributed init failed: %s", _e)
         if not _use_native_mlx_allreduce:
             logger.info("Using UDP allreduce (MLX distributed not available for multi-node)")
 
