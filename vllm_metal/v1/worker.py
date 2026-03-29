@@ -122,16 +122,18 @@ def init_worker_distributed_environment(
                 ip_list = [None] * tdist.get_world_size()
                 tdist.all_gather_object(ip_list, my_ip)
                 mlx_ring_port = int(os.environ.get("MLX_RING_PORT", "29500"))
-                # Map to TB4 IPs if available (30+ Gbps vs 10 Gbps Ethernet)
+                # Map to TB4 IPs only for TP=2 (same TB4 pair).
+                # For TP>2, cross-pair traffic goes over 10GbE anyway.
                 _tb4_subnet = None
-                try:
-                    _ifout = subprocess.check_output(
-                        ["ifconfig"], text=True, timeout=5)
-                    for _m in re.finditer(r"inet (10\.10\.(\d+)\.\d+)", _ifout):
-                        _tb4_subnet = _m.group(2)
-                        break
-                except Exception:
-                    pass
+                if tp_size == 2:
+                    try:
+                        _ifout = subprocess.check_output(
+                            ["ifconfig"], text=True, timeout=5)
+                        for _m in re.finditer(r"inet (10\.10\.(\d+)\.\d+)", _ifout):
+                            _tb4_subnet = _m.group(2)
+                            break
+                    except Exception:
+                        pass
                 def _to_tb4(ip):
                     parts = ip.split(".")
                     if _tb4_subnet and parts[0] == "10" and parts[1] == "255":
