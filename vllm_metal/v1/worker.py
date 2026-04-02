@@ -576,6 +576,10 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.execute_model(scheduler_output)
 
+    def take_draft_token_ids(self):
+        """Return draft token IDs from the model runner (spec decode)."""
+        return self.model_runner.take_draft_token_ids()
+
     def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput:
         """Return sampled tokens for the previously executed batch."""
         return self.model_runner.sample_tokens(grammar_output)

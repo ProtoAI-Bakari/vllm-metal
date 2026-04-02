@@ -46,6 +46,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm.v1.outputs import DraftTokenIds
 from vllm_metal.config import get_config
 from vllm_metal.paged_attention_common import (
     OffsetCache,
@@ -622,6 +623,62 @@ class MetalModelRunner:
         self.tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         self.tp_rank = 0  # Updated in load_model after distributed init
         logger.info("ProtoAI-Bakari--init: tp_size=%d from parallel_config", self.tp_size)
+
+        # Speculative decoding (ngram proposer)
+        self.speculative_config = getattr(vllm_config, "speculative_config", None)
+        self.num_spec_tokens = 0
+        self.drafter = None
+        self._draft_token_ids: list[list[int]] | None = None
+        self._draft_token_req_ids: list[str] | None = None
+        if self.speculative_config and self.speculative_config.method == "ngram":
+            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+            self.drafter = NgramProposer(self.vllm_config)
+            self.num_spec_tokens = self.speculative_config.num_speculative_tokens
+            logger.info("ProtoAI-Bakari--init: ngram spec decode enabled, num_spec_tokens=%d", self.num_spec_tokens)
+
+    def take_draft_token_ids(self) -> "DraftTokenIds | None":
+        """Return draft token IDs from the ngram proposer."""
+        if not self.num_spec_tokens or not self._draft_token_req_ids:
+            return None
+        draft = self._draft_token_ids
+        req_ids = self._draft_token_req_ids
+        self._draft_token_ids = None
+        self._draft_token_req_ids = None
+        if draft is None:
+            return None
+        return DraftTokenIds(req_ids, draft)
+
+    def _propose_draft_tokens(self, req_ids: list[str], sampled_tokens: list[list[int]]) -> None:
+        """Run ngram proposer to generate draft tokens for next step."""
+        if self.drafter is None or not self.num_spec_tokens:
+            return
+        try:
+            batch_size = len(req_ids)
+            max_len = self.model_config.max_model_len or 4096
+
+            # Build token_ids_cpu: (batch_size, max_model_len) numpy array
+            token_ids_cpu = np.zeros((batch_size, max_len), dtype=np.int64)
+            num_tokens_no_spec = np.zeros(batch_size, dtype=np.int64)
+
+            for i, req_id in enumerate(req_ids):
+                state = self._request_states.get(req_id)
+                if state is not None:
+                    tids = state.token_ids
+                    n = min(len(tids), max_len)
+                    token_ids_cpu[i, :n] = tids[:n]
+                    num_tokens_no_spec[i] = n
+
+            draft_token_ids = self.drafter.propose(
+                sampled_token_ids=sampled_tokens,
+                num_tokens_no_spec=num_tokens_no_spec,
+                token_ids_cpu=token_ids_cpu,
+            )
+            self._draft_token_ids = draft_token_ids
+            self._draft_token_req_ids = list(req_ids)
+        except Exception as e:
+            logger.warning("Ngram proposer failed: %s", e)
+            self._draft_token_ids = None
+            self._draft_token_req_ids = None
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -2807,6 +2864,11 @@ class MetalModelRunner:
             prompt_logprobs_dict={},
             pooler_output=[None] * len(req_ids),
         )
+
+        # Generate draft tokens for speculative decoding
+        if self.drafter is not None:
+            self._propose_draft_tokens(req_ids, sampled_tokens)
+
         return None
 
     def sample_tokens(
